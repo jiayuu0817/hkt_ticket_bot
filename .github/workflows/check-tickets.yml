@@ -3,7 +3,7 @@ name: Check HK Ticketing Availability
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17,22,27,32,37,42,47,52,57,2,7,12 * * * *"
+    - cron: "15,21,25,30,35,40,45,50,55,5,10,13 * * * *"
 
 permissions:
   contents: write
