@@ -2,8 +2,8 @@ name: Check HK Ticketing Availability
 
 on:
   schedule:
-    # 每 5 分鐘檢查一次(GitHub Actions 的排程本身可能有數分鐘誤差)
-    - cron: "*/5 * * * *"
+  # 每 5 分鐘檢查一次(GitHub Actions 的排程本身可能有數分鐘誤差)
+    - cron: "2-59/5 * * * *"
   workflow_dispatch: {} # 允許在 GitHub 網頁上手動按「Run workflow」測試
 
 permissions:
