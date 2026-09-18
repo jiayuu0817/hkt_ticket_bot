@@ -32,7 +32,7 @@ NETWORK_LOG_FILE = "network_log.json"
 SOLD_OUT_KEYWORDS = [
     "售罄", "已售完", "SOLD OUT", "Sold Out", "尚未開賣", "尚未開始",
     "敬請留意", "貨源已被搶購一空", "暫時沒有", "沒有可供選購",
-    "No tickets available", "座位已滿",
+    "No tickets available", "座位已滿", "暫無可售",
 ]
 AVAILABLE_KEYWORDS = [
     "選擇座位", "選擇票區", "加入購物車", "立即購買", "Buy Now",
