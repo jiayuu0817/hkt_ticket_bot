@@ -1,23 +1,23 @@
 """
 check_tickets.py
 ---------------------------------------
-定期檢查快達票(hkticketing)頁面是否有票可購買，
-一旦狀態從「售罄/不明」變成「有票」，就用 Telegram 通知。
+監控香港快達票 HK Ticketing 指定活動是否釋票。
 
-因為目標頁面是 JS 單頁應用(SPA)，直接用 requests 抓不到內容，
-所以這裡用 Playwright 啟動一個無頭瀏覽器把頁面「真的打開」再讀取文字。
+判斷方式：
+1. 找出頁面上的所有演出場次。
+2. 檢查每個場次自己的區塊是否顯示「暫無可售」。
+3. 只要其中一個場次沒有「暫無可售」，就視為疑似釋票。
+4. 再嘗試點擊該場次，確認是否出現：
+   - 票價類別
+   - 下一步
+   - 其他購票相關文字
+5. 偵測到疑似有票時，用 Telegram 通知。
 
-判斷原則：
-1. 只要頁面出現任何「有票關鍵字」，直接判定 available。
-2. 如果沒有任何有票關鍵字，但有「售罄/暫無可售」關鍵字，
-   則判定 sold_out。
-3. 兩者都沒有才判定 unclear。
-
-這樣即使三個場次中只有一場釋票、另外兩場仍顯示「暫無可售」，
-也會正確發送 Telegram 通知。
+這樣不需要網站真的顯示「有票」兩個字。
 """
 
 import os
+import re
 import json
 from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
@@ -38,29 +38,27 @@ NETWORK_LOG_FILE = "network_log.json"
 
 
 # ---------------------------------------------------------------
-# 沒票 / 售罄關鍵字
+# 場次顯示「沒票」時會看到的文字
 # ---------------------------------------------------------------
 SOLD_OUT_KEYWORDS = [
+    "暫無可售",
     "售罄",
     "已售完",
     "SOLD OUT",
     "Sold Out",
     "尚未開賣",
     "尚未開始",
-    "敬請留意",
-    "貨源已被搶購一空",
-    "暫時沒有",
     "沒有可供選購",
     "No tickets available",
-    "座位已滿",
-    "暫無可售",
 ]
 
 
 # ---------------------------------------------------------------
-# 有票 / 可以進一步購買的關鍵字
+# 點進疑似有票的場次後，可用來再次確認的文字
 # ---------------------------------------------------------------
 AVAILABLE_KEYWORDS = [
+    "票價類別",
+    "下一步",
     "選擇座位",
     "選擇票區",
     "加入購物車",
@@ -73,7 +71,7 @@ AVAILABLE_KEYWORDS = [
 
 
 def send_telegram(text, photo_path=None):
-    """用 Telegram Bot API 發送文字，若有截圖就一起傳。"""
+    """透過 Telegram Bot API 發送通知。"""
     import urllib.request
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -96,8 +94,7 @@ def send_telegram(text, photo_path=None):
             f'Content-Disposition: form-data; name="caption"\r\n\r\n'
             f"{text}\r\n"
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="photo"; '
-            f'filename="shot.png"\r\n'
+            f'Content-Disposition: form-data; name="photo"; filename="shot.png"\r\n'
             f"Content-Type: image/png\r\n\r\n"
         ).encode("utf-8") + photo_data + (
             f"\r\n--{boundary}--\r\n"
@@ -135,7 +132,6 @@ def send_telegram(text, photo_path=None):
 
 
 def load_last_state():
-    """讀取上一次票務狀態。"""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             return f.read().strip()
@@ -144,15 +140,20 @@ def load_last_state():
 
 
 def save_state(state):
-    """儲存這次票務狀態。"""
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         f.write(state)
 
 
 def main():
+
     captured_responses = []
 
+    available_sessions = []
+    sold_out_sessions = []
+    detected_confirmation = []
+
     with sync_playwright() as p:
+
         browser = p.chromium.launch(headless=True)
 
         context = browser.new_context(
@@ -168,18 +169,21 @@ def main():
         page = context.new_page()
 
         # -------------------------------------------------------
-        # 記錄頁面背後呼叫的 API JSON
-        # 未來如果找到真正票量 API，
-        # 可以改成直接打 API，不必每次開瀏覽器。
+        # 記錄網站背景 API
         # -------------------------------------------------------
         def on_response(response):
             try:
-                content_type = response.headers.get("content-type", "")
+                content_type = response.headers.get(
+                    "content-type",
+                    "",
+                )
 
                 if (
                     "json" in content_type
-                    and response.request.resource_type in ("xhr", "fetch")
+                    and response.request.resource_type
+                    in ("xhr", "fetch")
                 ):
+
                     url = response.url
 
                     if any(
@@ -193,8 +197,10 @@ def main():
                             "product",
                         ]
                     ):
+
                         try:
                             body = response.json()
+
                         except Exception:
                             body = None
 
@@ -211,7 +217,7 @@ def main():
         page.on("response", on_response)
 
         # -------------------------------------------------------
-        # 開啟快達票頁面
+        # 開啟快達票
         # -------------------------------------------------------
         page.goto(
             TICKET_URL,
@@ -219,24 +225,213 @@ def main():
             timeout=60000,
         )
 
-        # 給 SPA 一點時間把場次資料渲染出來
+        # 等 SPA 資料載入
         page.wait_for_timeout(5000)
 
-        # 儲存整頁截圖
+        # -------------------------------------------------------
+        # 找出每個場次區塊
+        #
+        # 原理：
+        # 從包含「2026年12月18日」這類日期的元素，
+        # 往上找到只包含一個日期的場次容器。
+        #
+        # 這樣就可以判斷：
+        #
+        # 12/18
+        # 暫無可售
+        #
+        # 跟
+        #
+        # 12/18
+        #
+        # 的差別。
+        # -------------------------------------------------------
+        session_blocks = page.evaluate(
+            """
+            () => {
+
+                const dateRegex =
+                    /20\\d{2}年\\d{1,2}月\\d{1,2}日/g;
+
+                const allElements =
+                    Array.from(document.querySelectorAll("*"));
+
+                const results = [];
+                const seen = new Set();
+
+                for (const el of allElements) {
+
+                    const ownText =
+                        (el.innerText || "").trim();
+
+                    const dates =
+                        ownText.match(dateRegex);
+
+                    if (!dates || dates.length === 0) {
+                        continue;
+                    }
+
+                    // 避免整個頁面的大容器
+                    if (ownText.length > 200) {
+                        continue;
+                    }
+
+                    let node = el;
+
+                    // 往父層找：
+                    // 只要父層仍然只包含一個場次日期，
+                    // 就把它視為同一個場次卡片。
+                    for (let i = 0; i < 5; i++) {
+
+                        if (!node.parentElement) {
+                            break;
+                        }
+
+                        const parentText =
+                            (node.parentElement.innerText || "")
+                            .trim();
+
+                        const parentDates =
+                            parentText.match(dateRegex) || [];
+
+                        if (
+                            parentDates.length === 1 &&
+                            parentText.length < 300
+                        ) {
+                            node = node.parentElement;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    const text =
+                        (node.innerText || "").trim();
+
+                    const foundDates =
+                        text.match(dateRegex) || [];
+
+                    if (foundDates.length !== 1) {
+                        continue;
+                    }
+
+                    const date = foundDates[0];
+
+                    if (seen.has(date)) {
+                        continue;
+                    }
+
+                    seen.add(date);
+
+                    results.push({
+                        date: date,
+                        text: text
+                    });
+                }
+
+                return results;
+            }
+            """
+        )
+
+        print("========== 場次偵測 ==========")
+
+        for session in session_blocks:
+
+            date = session["date"]
+            text = session["text"]
+
+            print(f"場次：{date}")
+            print(f"內容：{text}")
+
+            has_sold_out_text = any(
+                keyword.lower() in text.lower()
+                for keyword in SOLD_OUT_KEYWORDS
+            )
+
+            if has_sold_out_text:
+
+                sold_out_sessions.append(date)
+
+                print("結果：暫無可售")
+
+            else:
+
+                available_sessions.append(date)
+
+                print("結果：疑似有票")
+
+        print("==============================")
+
+        # -------------------------------------------------------
+        # 如果發現某場次沒有「暫無可售」
+        # 嘗試點進去進一步確認
+        # -------------------------------------------------------
+        if available_sessions:
+
+            target_date = available_sessions[0]
+
+            print(
+                f"嘗試點擊疑似有票場次："
+                f"{target_date}"
+            )
+
+            try:
+
+                locator = page.get_by_text(
+                    re.compile(
+                        re.escape(target_date)
+                    )
+                )
+
+                if locator.count() > 0:
+
+                    locator.first.click(
+                        timeout=5000
+                    )
+
+                    page.wait_for_timeout(3000)
+
+                    detail_text = page.inner_text(
+                        "body"
+                    )
+
+                    detected_confirmation = [
+                        keyword
+                        for keyword in AVAILABLE_KEYWORDS
+                        if keyword.lower()
+                        in detail_text.lower()
+                    ]
+
+                    print(
+                        "進一步確認關鍵字：",
+                        detected_confirmation
+                        if detected_confirmation
+                        else "沒有，但場次已無暫無可售"
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"點擊場次確認失敗：{e}"
+                )
+
+        # -------------------------------------------------------
+        # 截圖
+        # -------------------------------------------------------
         page.screenshot(
             path=SCREENSHOT_FILE,
             full_page=True,
         )
 
-        # 取得整頁文字
-        body_text = page.inner_text("body")
-
-        # 儲存攔截到的 API
+        # -------------------------------------------------------
+        # 儲存 API Log
+        # -------------------------------------------------------
         with open(
             NETWORK_LOG_FILE,
             "w",
             encoding="utf-8",
         ) as f:
+
             json.dump(
                 captured_responses,
                 f,
@@ -247,45 +442,19 @@ def main():
         browser.close()
 
     # -----------------------------------------------------------
-    # 判斷票務狀態
+    # 判定整體狀態
     # -----------------------------------------------------------
-    lower_text = body_text.lower()
 
-    matched_available = [
-        keyword
-        for keyword in AVAILABLE_KEYWORDS
-        if keyword.lower() in lower_text
-    ]
+    if available_sessions:
 
-    matched_sold_out = [
-        keyword
-        for keyword in SOLD_OUT_KEYWORDS
-        if keyword.lower() in lower_text
-    ]
-
-    has_buy_signal = bool(matched_available)
-    is_sold_out = bool(matched_sold_out)
-
-    # -----------------------------------------------------------
-    # 最重要的地方：
-    #
-    # 只要出現任何有票關鍵字，就優先判定為 available。
-    #
-    # 例如：
-    # 12/18 暫無可售
-    # 12/19 選擇座位
-    # 12/20 暫無可售
-    #
-    # 雖然頁面同時有「暫無可售」，
-    # 仍會判定 available。
-    # -----------------------------------------------------------
-    if has_buy_signal:
         current_state = "available"
 
-    elif is_sold_out:
+    elif sold_out_sessions:
+
         current_state = "sold_out"
 
     else:
+
         current_state = "unclear"
 
     last_state = load_last_state()
@@ -296,33 +465,62 @@ def main():
         .strftime("%Y-%m-%d %H:%M:%S")
     )
 
+    print("")
+    print("========== 最終結果 ==========")
+
     print(
         f"[{now}] "
-        f"上次狀態: {last_state} "
-        f"-> 這次狀態: {current_state}"
+        f"上次狀態：{last_state} "
+        f"-> 這次狀態：{current_state}"
     )
 
     print(
-        f"找到的有票關鍵字: "
-        f"{matched_available if matched_available else '無'}"
+        "暫無可售場次：",
+        sold_out_sessions
+        if sold_out_sessions
+        else "無"
     )
 
     print(
-        f"找到的售罄關鍵字: "
-        f"{matched_sold_out if matched_sold_out else '無'}"
+        "疑似有票場次：",
+        available_sessions
+        if available_sessions
+        else "無"
     )
+
+    print(
+        "確認關鍵字：",
+        detected_confirmation
+        if detected_confirmation
+        else "無"
+    )
+
+    print("==============================")
 
     # -----------------------------------------------------------
     # 有票通知
     # -----------------------------------------------------------
-    if current_state == "available" and last_state != "available":
+    if (
+        current_state == "available"
+        and last_state != "available"
+    ):
 
-        matched_text = "、".join(matched_available)
+        session_text = "\n".join(
+            f"• {session}"
+            for session in available_sessions
+        )
+
+        confirmation_text = (
+            "、".join(detected_confirmation)
+            if detected_confirmation
+            else "場次的「暫無可售」已消失"
+        )
 
         send_telegram(
             (
-                f"🎫 快達票可能有票了！\n\n"
-                f"偵測到：{matched_text}\n"
+                "🎫 快達票疑似釋票！\n\n"
+                f"場次：\n{session_text}\n\n"
+                f"偵測依據：{confirmation_text}\n\n"
                 f"時間：{now}\n\n"
                 f"{TICKET_URL}"
             ),
@@ -330,7 +528,7 @@ def main():
         )
 
     # -----------------------------------------------------------
-    # 第一次完全判斷不到時才通知
+    # 第一次完全無法判斷
     # -----------------------------------------------------------
     elif (
         current_state == "unclear"
@@ -339,10 +537,10 @@ def main():
 
         send_telegram(
             (
-                "⚠️ 目前無法自動判斷票務狀態。\n"
-                "請打開 GitHub Actions 的截圖確認頁面文字，"
-                "並調整關鍵字。\n\n"
-                f"時間：{now}\n"
+                "⚠️ 快達票目前無法判斷票務狀態。\n\n"
+                "請查看 GitHub Actions 的 "
+                "latest_screenshot.png。\n\n"
+                f"時間：{now}\n\n"
                 f"{TICKET_URL}"
             ),
             photo_path=SCREENSHOT_FILE,
