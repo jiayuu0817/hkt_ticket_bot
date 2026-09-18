@@ -45,7 +45,6 @@ jobs:
           git config user.name "ticket-watcher-bot"
           git config user.email "actions@users.noreply.github.com"
 
-          # 先取得 GitHub 上最新版本，避免 push 被拒絕
           git pull --rebase origin main
 
           git add status.txt
