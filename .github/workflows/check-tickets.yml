@@ -44,6 +44,15 @@ jobs:
         run: |
           git config user.name "ticket-watcher-bot"
           git config user.email "actions@users.noreply.github.com"
+
+          # 先取得 GitHub 上最新版本，避免 push 被拒絕
+          git pull --rebase origin main
+
           git add status.txt
-          git diff --cached --quiet || git commit -m "更新票務狀態 [skip ci]"
-          git push
+
+          if ! git diff --cached --quiet; then
+            git commit -m "更新票務狀態 [skip ci]"
+            git push origin main
+          else
+            echo "status.txt 沒有變化，不需要提交"
+          fi
