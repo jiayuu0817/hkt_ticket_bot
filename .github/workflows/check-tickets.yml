@@ -1,0 +1,49 @@
+name: Check HK Ticketing Availability
+
+on:
+  schedule:
+    # 每 10 分鐘檢查一次(GitHub Actions 的排程本身可能有數分鐘誤差)
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {} # 允許在 GitHub 網頁上手動按「Run workflow」測試
+
+permissions:
+  contents: write # 讓 workflow 可以把最新狀態寫回 repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: 檢查票務狀態
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_tickets.py
+
+      - name: 上傳除錯截圖與網路紀錄
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_number }}
+          path: |
+            latest_screenshot.png
+            network_log.json
+          retention-days: 3
+
+      - name: 提交最新狀態
+        run: |
+          git config user.name "ticket-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add status.txt
+          git diff --cached --quiet || git commit -m "更新票務狀態 [skip ci]"
+          git push
